@@ -1,0 +1,15 @@
+node_modules/
+dist/
+build/
+*.pyc
+__pycache__/
+.next/
+.nuxt/
+out/
+训练记录.md
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+*.log
+*.xlsx
