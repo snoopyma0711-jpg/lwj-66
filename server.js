@@ -302,98 +302,63 @@ function updatePetitionStatus(petitionId, fromStatus, toStatus, operator, remark
   });
 }
 
-function checkOverdueAndWarnings() {
-  return new Promise((resolve, reject) => {
-    const now = new Date();
-    db.all(`SELECT p.*, d.name as dept_name FROM petitions p
+async function checkOverdueAndWarnings() {
+  const now = new Date();
+  const petitions = await allSql(`SELECT p.*, d.name as dept_name FROM petitions p
             LEFT JOIN departments d ON p.primary_dept_id = d.id
-            WHERE p.status IN ('已分拨', '办理中') AND p.assigned_at IS NOT NULL`,
-      (err, petitions) => {
-        if (err) return reject(err);
-        let pending = petitions.length;
-        if (pending === 0) return resolve();
+            WHERE p.status IN ('已分拨', '办理中') AND p.assigned_at IS NOT NULL`);
 
-        petitions.forEach(petition => {
-          const assignedAt = new Date(petition.assigned_at);
-          const deadline = new Date(assignedAt.getTime() + petition.expected_days * 24 * 60 * 60 * 1000);
-          const totalMs = petition.expected_days * 24 * 60 * 60 * 1000;
-          const remainingMs = deadline - now;
-          const remainingRatio = remainingMs / totalMs;
-          const overdueDays = Math.floor((now - deadline) / (24 * 60 * 60 * 1000));
+  for (const petition of petitions) {
+    try {
+      const assignedAt = new Date(petition.assigned_at);
+      const deadline = new Date(assignedAt.getTime() + petition.expected_days * 24 * 60 * 60 * 1000);
+      const totalMs = petition.expected_days * 24 * 60 * 60 * 1000;
+      const remainingMs = deadline - now;
+      const remainingRatio = remainingMs / totalMs;
+      const overdueDays = Math.floor((now - deadline) / (24 * 60 * 60 * 1000));
 
-          if (remainingRatio > 0 && remainingRatio < 0.25) {
-            checkAndCreateWarning(petition.id, WARNING_YELLOW, 
-              `距离办理时限仅剩不足25%，请加快处理进度，截止日期: ${deadline.toLocaleString()}`)
-              .then(() => { pending--; if (pending === 0) resolve(); });
-          } else if (remainingMs <= 0) {
-            checkAndCreateWarning(petition.id, WARNING_RED, 
-              `已超期${overdueDays}天未办结，请立即处理`)
-              .then(() => {
-                if (overdueDays >= 3 && !petition.is_escalated) {
-                  escalatePetition(petition.id, overdueDays).then(() => {
-                    pending--;
-                    if (pending === 0) resolve();
-                  });
-                } else {
-                  pending--;
-                  if (pending === 0) resolve();
-                }
-              });
-          } else {
-            pending--;
-            if (pending === 0) resolve();
-          }
-        });
-      }
-    );
-  });
-}
-
-function checkAndCreateWarning(petitionId, level, message) {
-  return new Promise((resolve, reject) => {
-    const today = new Date().toDateString();
-    db.get(`SELECT * FROM warnings WHERE petition_id = ? AND level = ? 
-            AND DATE(created_at) = DATE('now') ORDER BY created_at DESC LIMIT 1`,
-      [petitionId, level],
-      (err, existing) => {
-        if (err) return reject(err);
-        if (!existing) {
-          db.run(`INSERT INTO warnings (petition_id, level, message) VALUES (?, ?, ?)`,
-            [petitionId, level, message],
-            function(err) {
-              if (err) return reject(err);
-              console.log(`[预警] 信访件#${petitionId} ${level === 'yellow' ? '黄色预警' : '红色预警'}: ${message}`);
-              resolve(this.lastID);
-            }
-          );
-        } else {
-          resolve();
+      if (remainingRatio > 0 && remainingRatio < 0.25) {
+        await checkAndCreateWarning(petition.id, WARNING_YELLOW, 
+          `距离办理时限仅剩不足25%，请加快处理进度，截止日期: ${deadline.toLocaleString()}`);
+      } else if (remainingMs <= 0) {
+        await checkAndCreateWarning(petition.id, WARNING_RED, 
+          `已超期${overdueDays}天未办结，请立即处理`);
+        
+        if (overdueDays >= 3 && !petition.is_escalated) {
+          await escalatePetition(petition.id, overdueDays, petition.status);
         }
       }
-    );
-  });
+    } catch (err) {
+      console.error(`[错误] 处理信访件#${petition.id} 预警/升级时出错:`, err.message);
+    }
+  }
 }
 
-function escalatePetition(petitionId, overdueDays) {
-  return new Promise((resolve, reject) => {
-    db.serialize(() => {
-      db.run(`UPDATE petitions SET is_escalated = 1 WHERE id = ?`, [petitionId], (err) => {
-        if (err) return reject(err);
-        addFlowLog(petitionId, null, null, 'system', 
-          `系统自动督办升级: 已超期${overdueDays}天，升级为重点督办件`).then(() => {
-            db.run(`INSERT INTO warnings (petition_id, level, message, is_escalation) 
-                    VALUES (?, ?, ?, 1)`,
-              [petitionId, WARNING_RED, `系统自动升级: 超期${overdueDays}天，列为重点督办件`],
-              function(err) {
-                if (err) return reject(err);
-                console.log(`[升级] 信访件#${petitionId} 已自动升级为督办件，超期${overdueDays}天`);
-                resolve();
-              }
-            );
-          });
-      });
-    });
-  });
+async function checkAndCreateWarning(petitionId, level, message) {
+  const existing = await getSql(`SELECT * FROM warnings WHERE petition_id = ? AND level = ? 
+            AND DATE(created_at) = DATE('now') ORDER BY created_at DESC LIMIT 1`,
+    [petitionId, level]);
+  
+  if (!existing) {
+    const result = await runSql(`INSERT INTO warnings (petition_id, level, message) VALUES (?, ?, ?)`,
+      [petitionId, level, message]);
+    console.log(`[预警] 信访件#${petitionId} ${level === 'yellow' ? '黄色预警' : '红色预警'}: ${message}`);
+    return result.lastID;
+  }
+  return null;
+}
+
+async function escalatePetition(petitionId, overdueDays, currentStatus) {
+  await runSql(`UPDATE petitions SET is_escalated = 1 WHERE id = ?`, [petitionId]);
+  
+  await addFlowLog(petitionId, currentStatus, currentStatus, 'system', 
+    `系统自动督办升级: 已超期${overdueDays}天，升级为重点督办件`);
+  
+  await runSql(`INSERT INTO warnings (petition_id, level, message, is_escalation) 
+                  VALUES (?, ?, ?, 1)`,
+    [petitionId, WARNING_RED, `系统自动升级: 超期${overdueDays}天，列为重点督办件`]);
+  
+  console.log(`[升级] 信访件#${petitionId} 已自动升级为督办件，超期${overdueDays}天`);
 }
 
 function getPetitionWithDetails(id) {
@@ -891,12 +856,28 @@ app.get('/api/warnings', (req, res) => {
   });
 });
 
-initDatabase().then(() => {
-  checkOverdueAndWarnings().catch(console.error);
+initDatabase().then(async () => {
+  try {
+    await checkOverdueAndWarnings();
+  } catch (err) {
+    console.error('首次超期检查出错:', err.message);
+  }
   
-  setInterval(() => {
-    checkOverdueAndWarnings().catch(console.error);
+  setInterval(async () => {
+    try {
+      await checkOverdueAndWarnings();
+    } catch (err) {
+      console.error('定时超期检查出错:', err.message);
+    }
   }, 60 * 1000);
+
+  process.on('unhandledRejection', (reason, promise) => {
+    console.error('未处理的 Promise 拒绝:', reason);
+  });
+
+  process.on('uncaughtException', (err) => {
+    console.error('未捕获的异常:', err.message, err.stack);
+  });
 
   app.listen(PORT, () => {
     console.log('========================================');
