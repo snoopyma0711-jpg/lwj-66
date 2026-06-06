@@ -25,6 +25,8 @@ const STATUS_ARCHIVED = '已归档';
 
 const WARNING_YELLOW = 'yellow';
 const WARNING_RED = 'red';
+const WARNING_TYPE_OVERDUE = 'overdue';
+const WARNING_TYPE_QUALITY = 'quality';
 
 const DEFAULT_DEPARTMENTS = [
   { id: 1, name: '城管局', code: 'CGJ' },
@@ -122,10 +124,35 @@ async function initDatabase() {
 
   await runSql(`CREATE TABLE IF NOT EXISTS warnings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    petition_id INTEGER NOT NULL,
+    petition_id INTEGER,
     level TEXT NOT NULL,
     message TEXT NOT NULL,
     is_escalation INTEGER DEFAULT 0,
+    type TEXT DEFAULT 'overdue',
+    dept_id INTEGER,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (petition_id) REFERENCES petitions(id),
+    FOREIGN KEY (dept_id) REFERENCES departments(id)
+  )`);
+
+  const warningsColumns = await allSql(`PRAGMA table_info(warnings)`);
+  const hasType = warningsColumns.some(c => c.name === 'type');
+  const hasDeptId = warningsColumns.some(c => c.name === 'dept_id');
+  if (!hasType) {
+    await runSql(`ALTER TABLE warnings ADD COLUMN type TEXT DEFAULT 'overdue'`);
+  }
+  if (!hasDeptId) {
+    await runSql(`ALTER TABLE warnings ADD COLUMN dept_id INTEGER REFERENCES departments(id)`);
+  }
+
+  await runSql(`CREATE TABLE IF NOT EXISTS visit_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    petition_id INTEGER NOT NULL UNIQUE,
+    visitor TEXT NOT NULL,
+    visit_time DATETIME NOT NULL,
+    score INTEGER NOT NULL CHECK (score >= 1 AND score <= 5),
+    feedback TEXT,
+    is_public INTEGER DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (petition_id) REFERENCES petitions(id)
   )`);
@@ -334,14 +361,14 @@ async function checkOverdueAndWarnings() {
   }
 }
 
-async function checkAndCreateWarning(petitionId, level, message) {
-  const existing = await getSql(`SELECT * FROM warnings WHERE petition_id = ? AND level = ? 
+async function checkAndCreateWarning(petitionId, level, message, type = WARNING_TYPE_OVERDUE) {
+  const existing = await getSql(`SELECT * FROM warnings WHERE petition_id = ? AND level = ? AND type = ?
             AND DATE(created_at) = DATE('now') ORDER BY created_at DESC LIMIT 1`,
-    [petitionId, level]);
+    [petitionId, level, type]);
   
   if (!existing) {
-    const result = await runSql(`INSERT INTO warnings (petition_id, level, message) VALUES (?, ?, ?)`,
-      [petitionId, level, message]);
+    const result = await runSql(`INSERT INTO warnings (petition_id, level, message, type) VALUES (?, ?, ?, ?)`,
+      [petitionId, level, message, type]);
     console.log(`[预警] 信访件#${petitionId} ${level === 'yellow' ? '黄色预警' : '红色预警'}: ${message}`);
     return result.lastID;
   }
@@ -354,11 +381,62 @@ async function escalatePetition(petitionId, overdueDays, currentStatus) {
   await addFlowLog(petitionId, currentStatus, currentStatus, 'system', 
     `系统自动督办升级: 已超期${overdueDays}天，升级为重点督办件`);
   
-  await runSql(`INSERT INTO warnings (petition_id, level, message, is_escalation) 
-                  VALUES (?, ?, ?, 1)`,
-    [petitionId, WARNING_RED, `系统自动升级: 超期${overdueDays}天，列为重点督办件`]);
+  await runSql(`INSERT INTO warnings (petition_id, level, message, is_escalation, type) 
+                  VALUES (?, ?, ?, 1, ?)`,
+    [petitionId, WARNING_RED, `系统自动升级: 超期${overdueDays}天，列为重点督办件`, WARNING_TYPE_OVERDUE]);
   
   console.log(`[升级] 信访件#${petitionId} 已自动升级为督办件，超期${overdueDays}天`);
+}
+
+async function checkAndCreateQualityWarning(deptId, deptName, badRate) {
+  const today = new Date().toISOString().split('T')[0];
+  const existing = await getSql(`SELECT * FROM warnings 
+    WHERE dept_id = ? AND type = ? AND DATE(created_at) = DATE(?)
+    ORDER BY created_at DESC LIMIT 1`,
+    [deptId, WARNING_TYPE_QUALITY, today]);
+  
+  if (!existing) {
+    const badRatePercent = (badRate * 100).toFixed(1);
+    const result = await runSql(`INSERT INTO warnings 
+      (dept_id, level, message, type) VALUES (?, ?, ?, ?)`,
+      [
+        deptId, 
+        WARNING_RED, 
+        `质量预警：${deptName}近30天差评率为${badRatePercent}%，已超过20%阈值`,
+        WARNING_TYPE_QUALITY
+      ]);
+    console.log(`[质量预警] ${deptName} 近30天差评率${badRatePercent}%，已生成预警记录`);
+    return result.lastID;
+  }
+  return null;
+}
+
+async function checkDepartmentQualityWarnings() {
+  const thirtyDaysAgo = new Date();
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+  
+  const sql = `
+    SELECT 
+      p.primary_dept_id as dept_id,
+      d.name as dept_name,
+      COUNT(v.id) as total_visits,
+      SUM(CASE WHEN v.score <= 2 THEN 1 ELSE 0 END) as bad_count
+    FROM visit_records v
+    JOIN petitions p ON v.petition_id = p.id
+    JOIN departments d ON p.primary_dept_id = d.id
+    WHERE DATE(v.visit_time) >= DATE(?)
+    GROUP BY p.primary_dept_id, d.name
+    HAVING total_visits > 0
+  `;
+  
+  const results = await allSql(sql, [thirtyDaysAgo.toISOString()]);
+  
+  for (const row of results) {
+    const badRate = row.bad_count / row.total_visits;
+    if (badRate > 0.20) {
+      await checkAndCreateQualityWarning(row.dept_id, row.dept_name, badRate);
+    }
+  }
 }
 
 function getPetitionWithDetails(id) {
@@ -385,16 +463,22 @@ function getPetitionWithDetails(id) {
               if (err) return reject(err);
               petition.warnings = warnings;
               
-              if (petition.assigned_at) {
-                const assignedAt = new Date(petition.assigned_at);
-                const now = new Date();
-                const deadline = new Date(assignedAt.getTime() + petition.expected_days * 24 * 60 * 60 * 1000);
-                petition.deadline = deadline.toISOString();
-                petition.remaining_days = Math.ceil((deadline - now) / (24 * 60 * 60 * 1000));
-                petition.overdue_days = Math.max(0, Math.floor((now - deadline) / (24 * 60 * 60 * 1000)));
-              }
-              
-              resolve(petition);
+              db.get(`SELECT * FROM visit_records WHERE petition_id = ?`,
+                [id], (err, visit) => {
+                  if (err) return reject(err);
+                  petition.visit_record = visit || null;
+                  
+                  if (petition.assigned_at) {
+                    const assignedAt = new Date(petition.assigned_at);
+                    const now = new Date();
+                    const deadline = new Date(assignedAt.getTime() + petition.expected_days * 24 * 60 * 60 * 1000);
+                    petition.deadline = deadline.toISOString();
+                    petition.remaining_days = Math.ceil((deadline - now) / (24 * 60 * 60 * 1000));
+                    petition.overdue_days = Math.max(0, Math.floor((now - deadline) / (24 * 60 * 60 * 1000)));
+                  }
+                  
+                  resolve(petition);
+                });
             });
         });
     });
@@ -841,19 +925,275 @@ app.get('/api/petitions/:id/logs', (req, res) => {
 });
 
 app.get('/api/warnings', (req, res) => {
-  const { level, petition_id } = req.query;
-  let sql = `SELECT w.*, p.petitioner_name, p.content 
+  const { level, petition_id, type, dept_id } = req.query;
+  let sql = `SELECT w.*, p.petitioner_name, p.content, d.name as dept_name
              FROM warnings w
-             JOIN petitions p ON w.petition_id = p.id WHERE 1=1`;
+             LEFT JOIN petitions p ON w.petition_id = p.id
+             LEFT JOIN departments d ON w.dept_id = d.id WHERE 1=1`;
   const params = [];
   if (level) { sql += ` AND w.level = ?`; params.push(level); }
   if (petition_id) { sql += ` AND w.petition_id = ?`; params.push(petition_id); }
+  if (type) { sql += ` AND w.type = ?`; params.push(type); }
+  if (dept_id) { sql += ` AND w.dept_id = ?`; params.push(dept_id); }
   sql += ` ORDER BY w.created_at DESC`;
   
   db.all(sql, params, (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
     res.json({ count: rows.length, data: rows });
   });
+});
+
+app.post('/api/visits', async (req, res) => {
+  const { petition_id, visitor, visit_time, score, feedback, is_public } = req.body;
+
+  if (!petition_id || !visitor || !visit_time || score === undefined) {
+    return res.status(400).json({ error: 'petition_id、visitor、visit_time、score为必填项' });
+  }
+
+  if (score < 1 || score > 5) {
+    return res.status(400).json({ error: '评分必须在1-5分之间' });
+  }
+
+  try {
+    const petition = await getSql(`SELECT * FROM petitions WHERE id = ?`, [petition_id]);
+    if (!petition) {
+      return res.status(404).json({ error: '信访件不存在' });
+    }
+
+    if (petition.status !== STATUS_ARCHIVED) {
+      return res.status(400).json({ error: '只有已归档的信访件才能发起回访' });
+    }
+
+    const existingVisit = await getSql(`SELECT * FROM visit_records WHERE petition_id = ?`, [petition_id]);
+    if (existingVisit) {
+      return res.status(400).json({ error: '该信访件已完成回访，不可重复回访' });
+    }
+
+    const result = await runSql(`INSERT INTO visit_records 
+      (petition_id, visitor, visit_time, score, feedback, is_public)
+      VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        petition_id,
+        visitor,
+        visit_time,
+        score,
+        feedback || null,
+        is_public ? 1 : 0
+      ]
+    );
+
+    const visitRecord = await getSql(`
+      SELECT v.*, p.petitioner_name, p.content, d.name as primary_dept_name
+      FROM visit_records v
+      JOIN petitions p ON v.petition_id = p.id
+      LEFT JOIN departments d ON p.primary_dept_id = d.id
+      WHERE v.id = ?`, [result.lastID]);
+
+    res.json({ 
+      id: result.lastID, 
+      message: '回访记录创建成功',
+      data: visitRecord
+    });
+  } catch (err) {
+    if (err.message.includes('UNIQUE constraint failed')) {
+      return res.status(400).json({ error: '该信访件已完成回访，不可重复回访' });
+    }
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/visits', async (req, res) => {
+  const { dept_id, score_min, score_max, is_public, start_date, end_date, page = 1, page_size = 20 } = req.query;
+
+  let sql = `SELECT v.*, p.petitioner_name, p.content, p.archived_at,
+             d.name as primary_dept_name, d.code as primary_dept_code
+             FROM visit_records v
+             JOIN petitions p ON v.petition_id = p.id
+             LEFT JOIN departments d ON p.primary_dept_id = d.id WHERE 1=1`;
+  const params = [];
+  const countParams = [];
+
+  if (dept_id) {
+    sql += ` AND p.primary_dept_id = ?`;
+    params.push(dept_id);
+    countParams.push(dept_id);
+  }
+  if (score_min) {
+    sql += ` AND v.score >= ?`;
+    params.push(score_min);
+    countParams.push(score_min);
+  }
+  if (score_max) {
+    sql += ` AND v.score <= ?`;
+    params.push(score_max);
+    countParams.push(score_max);
+  }
+  if (is_public !== undefined) {
+    sql += ` AND v.is_public = ?`;
+    params.push(is_public ? 1 : 0);
+    countParams.push(is_public ? 1 : 0);
+  }
+  if (start_date) {
+    sql += ` AND DATE(v.visit_time) >= DATE(?)`;
+    params.push(start_date);
+    countParams.push(start_date);
+  }
+  if (end_date) {
+    sql += ` AND DATE(v.visit_time) <= DATE(?)`;
+    params.push(end_date);
+    countParams.push(end_date);
+  }
+
+  let countSql = `SELECT COUNT(*) as total FROM visit_records v
+                  JOIN petitions p ON v.petition_id = p.id WHERE 1=1`;
+  if (dept_id || score_min || score_max || is_public !== undefined || start_date || end_date) {
+    if (dept_id) countSql += ` AND p.primary_dept_id = ?`;
+    if (score_min) countSql += ` AND v.score >= ?`;
+    if (score_max) countSql += ` AND v.score <= ?`;
+    if (is_public !== undefined) countSql += ` AND v.is_public = ?`;
+    if (start_date) countSql += ` AND DATE(v.visit_time) >= DATE(?)`;
+    if (end_date) countSql += ` AND DATE(v.visit_time) <= DATE(?)`;
+  }
+
+  sql += ` ORDER BY v.visit_time DESC LIMIT ? OFFSET ?`;
+  params.push(parseInt(page_size), (parseInt(page) - 1) * parseInt(page_size));
+
+  try {
+    const countRow = await getSql(countSql, countParams);
+    const rows = await allSql(sql, params);
+    res.json({
+      total: countRow.total,
+      page: parseInt(page),
+      page_size: parseInt(page_size),
+      data: rows
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/visits/:id', async (req, res) => {
+  try {
+    const visit = await getSql(`
+      SELECT v.*, p.petitioner_name, p.petitioner_contact, p.content, p.archived_at, p.result_text,
+             d1.name as primary_dept_name, d1.code as primary_dept_code,
+             d2.name as co_dept1_name, d3.name as co_dept2_name
+      FROM visit_records v
+      JOIN petitions p ON v.petition_id = p.id
+      LEFT JOIN departments d1 ON p.primary_dept_id = d1.id
+      LEFT JOIN departments d2 ON p.co_dept1_id = d2.id
+      LEFT JOIN departments d3 ON p.co_dept2_id = d3.id
+      WHERE v.id = ?`, [req.params.id]);
+
+    if (!visit) {
+      return res.status(404).json({ error: '回访记录不存在' });
+    }
+
+    res.json({ data: visit });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/petitions/:id/visit', async (req, res) => {
+  try {
+    const visit = await getSql(`
+      SELECT v.*, p.petitioner_name, p.content, p.archived_at,
+             d.name as primary_dept_name
+      FROM visit_records v
+      JOIN petitions p ON v.petition_id = p.id
+      LEFT JOIN departments d ON p.primary_dept_id = d.id
+      WHERE v.petition_id = ?`, [req.params.id]);
+
+    if (!visit) {
+      return res.status(404).json({ error: '该信访件暂无回访记录' });
+    }
+
+    res.json({ data: visit });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/statistics/dept-ranking', async (req, res) => {
+  const { sort_by = 'avg_score', start_date, end_date } = req.query;
+
+  if (sort_by !== 'avg_score' && sort_by !== 'good_rate') {
+    return res.status(400).json({ error: 'sort_by只能是avg_score或good_rate' });
+  }
+
+  try {
+    await checkDepartmentQualityWarnings();
+
+    let sql = `
+      SELECT 
+        d.id as dept_id,
+        d.name as dept_name,
+        d.code as dept_code,
+        COUNT(v.id) as visited_count,
+        AVG(v.score) as avg_score,
+        ROUND(SUM(CASE WHEN v.score >= 4 THEN 1 ELSE 0 END) * 100.0 / COUNT(v.id), 2) as good_rate,
+        SUM(CASE WHEN v.score <= 2 THEN 1 ELSE 0 END) as bad_count
+      FROM departments d
+      JOIN petitions p ON d.id = p.primary_dept_id
+      JOIN visit_records v ON p.id = v.petition_id
+      WHERE 1=1
+    `;
+    const params = [];
+
+    if (start_date) {
+      sql += ` AND DATE(p.archived_at) >= DATE(?)`;
+      params.push(start_date);
+    }
+    if (end_date) {
+      sql += ` AND DATE(p.archived_at) <= DATE(?)`;
+      params.push(end_date);
+    }
+
+    sql += ` GROUP BY d.id, d.name, d.code HAVING visited_count > 0`;
+
+    if (sort_by === 'avg_score') {
+      sql += ` ORDER BY avg_score DESC, good_rate DESC, visited_count DESC`;
+    } else {
+      sql += ` ORDER BY good_rate DESC, avg_score DESC, visited_count DESC`;
+    }
+
+    const rows = await allSql(sql, params);
+
+    const result = rows.map((row, index) => ({
+      rank: index + 1,
+      dept_id: row.dept_id,
+      dept_name: row.dept_name,
+      dept_code: row.dept_code,
+      visited_count: row.visited_count,
+      avg_score: row.avg_score ? Math.round(row.avg_score * 100) / 100 : 0,
+      good_rate: row.good_rate ? row.good_rate : 0,
+      bad_count: row.bad_count || 0
+    }));
+
+    let summary = null;
+    if (result.length > 0) {
+      const totalVisited = result.reduce((sum, r) => sum + r.visited_count, 0);
+      const totalBad = result.reduce((sum, r) => sum + r.bad_count, 0);
+      const avgAllScore = result.reduce((sum, r) => sum + r.avg_score * r.visited_count, 0) / totalVisited;
+      summary = {
+        total_depts: result.length,
+        total_visited: totalVisited,
+        overall_avg_score: Math.round(avgAllScore * 100) / 100,
+        overall_good_rate: Math.round((totalVisited - totalBad) / totalVisited * 10000) / 100
+      };
+    }
+
+    res.json({
+      sort_by: sort_by,
+      start_date: start_date || null,
+      end_date: end_date || null,
+      summary: summary,
+      data: result
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 initDatabase().then(async () => {
@@ -904,6 +1244,12 @@ initDatabase().then(async () => {
     console.log('  GET  /api/petitions/supervise    - 督办查询（预警/部门/超期）');
     console.log('  GET  /api/petitions/:id/logs     - 查询流转日志');
     console.log('  GET  /api/warnings               - 查询预警记录');
+    console.log('  -------- 满意度回访与统计分析 --------');
+    console.log('  POST /api/visits                 - 发起回访记录');
+    console.log('  GET  /api/visits                 - 查询回访列表');
+    console.log('  GET  /api/visits/:id             - 查询单条回访详情');
+    console.log('  GET  /api/petitions/:id/visit    - 查询信访件的回访记录');
+    console.log('  GET  /api/statistics/dept-ranking- 部门办理质量排名');
     console.log('========================================');
   });
 }).catch(err => {
