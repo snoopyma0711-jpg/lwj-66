@@ -28,6 +28,14 @@ const WARNING_RED = 'red';
 const WARNING_TYPE_OVERDUE = 'overdue';
 const WARNING_TYPE_QUALITY = 'quality';
 
+function parseBooleanParam(val) {
+  if (val === undefined || val === null) return null;
+  if (typeof val === 'boolean') return val;
+  if (typeof val === 'number') return val !== 0;
+  const strVal = String(val).toLowerCase().trim();
+  return !['0', 'false', 'no', '否', '不公开', '未公开', '非公开'].includes(strVal);
+}
+
 const DEFAULT_DEPARTMENTS = [
   { id: 1, name: '城管局', code: 'CGJ' },
   { id: 2, name: '民政局', code: 'MZJ' },
@@ -738,6 +746,8 @@ app.put('/api/petitions/:id/archive', async (req, res) => {
     return res.status(400).json({ error: 'operator和is_satisfied为必填项' });
   }
 
+  const isSatisfiedVal = parseBooleanParam(is_satisfied);
+
   try {
     const petition = await new Promise((r, reject) => db.get(`SELECT * FROM petitions WHERE id = ?`, [id], (e, row) => { if (e) reject(e); else r(row); }));
     if (!petition) return res.status(404).json({ error: '信访件不存在' });
@@ -745,7 +755,7 @@ app.put('/api/petitions/:id/archive', async (req, res) => {
       return res.status(400).json({ error: '只有已办结状态的信访件可以确认归档' });
     }
 
-    if (is_satisfied) {
+    if (isSatisfiedVal) {
       db.run(`UPDATE petitions SET status = ?, archived_at = ? WHERE id = ?`,
         [STATUS_ARCHIVED, new Date().toISOString(), id],
         async function(err) {
@@ -969,6 +979,7 @@ app.post('/api/visits', async (req, res) => {
       return res.status(400).json({ error: '该信访件已完成回访，不可重复回访' });
     }
 
+    const isPublicVal = parseBooleanParam(is_public);
     const result = await runSql(`INSERT INTO visit_records 
       (petition_id, visitor, visit_time, score, feedback, is_public)
       VALUES (?, ?, ?, ?, ?, ?)`,
@@ -978,7 +989,7 @@ app.post('/api/visits', async (req, res) => {
         visit_time,
         score,
         feedback || null,
-        is_public ? 1 : 0
+        isPublicVal ? 1 : 0
       ]
     );
 
@@ -1029,9 +1040,10 @@ app.get('/api/visits', async (req, res) => {
     countParams.push(score_max);
   }
   if (is_public !== undefined) {
+    const isPublicVal = parseBooleanParam(is_public);
     sql += ` AND v.is_public = ?`;
-    params.push(is_public ? 1 : 0);
-    countParams.push(is_public ? 1 : 0);
+    params.push(isPublicVal ? 1 : 0);
+    countParams.push(isPublicVal ? 1 : 0);
   }
   if (start_date) {
     sql += ` AND DATE(v.visit_time) >= DATE(?)`;
@@ -1132,6 +1144,7 @@ app.get('/api/statistics/dept-ranking', async (req, res) => {
         d.code as dept_code,
         COUNT(v.id) as visited_count,
         AVG(v.score) as avg_score,
+        SUM(CASE WHEN v.score >= 4 THEN 1 ELSE 0 END) as good_count,
         ROUND(SUM(CASE WHEN v.score >= 4 THEN 1 ELSE 0 END) * 100.0 / COUNT(v.id), 2) as good_rate,
         SUM(CASE WHEN v.score <= 2 THEN 1 ELSE 0 END) as bad_count
       FROM departments d
@@ -1167,6 +1180,7 @@ app.get('/api/statistics/dept-ranking', async (req, res) => {
       dept_code: row.dept_code,
       visited_count: row.visited_count,
       avg_score: row.avg_score ? Math.round(row.avg_score * 100) / 100 : 0,
+      good_count: row.good_count || 0,
       good_rate: row.good_rate ? row.good_rate : 0,
       bad_count: row.bad_count || 0
     }));
@@ -1174,13 +1188,14 @@ app.get('/api/statistics/dept-ranking', async (req, res) => {
     let summary = null;
     if (result.length > 0) {
       const totalVisited = result.reduce((sum, r) => sum + r.visited_count, 0);
+      const totalGood = result.reduce((sum, r) => sum + r.good_count, 0);
       const totalBad = result.reduce((sum, r) => sum + r.bad_count, 0);
       const avgAllScore = result.reduce((sum, r) => sum + r.avg_score * r.visited_count, 0) / totalVisited;
       summary = {
         total_depts: result.length,
         total_visited: totalVisited,
         overall_avg_score: Math.round(avgAllScore * 100) / 100,
-        overall_good_rate: Math.round((totalVisited - totalBad) / totalVisited * 10000) / 100
+        overall_good_rate: totalVisited > 0 ? Math.round(totalGood / totalVisited * 10000) / 100 : 0
       };
     }
 
