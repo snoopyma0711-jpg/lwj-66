@@ -1,15 +1,27 @@
+# 编译产物
 node_modules/
 dist/
 build/
-*.pyc
-__pycache__/
 .next/
 .nuxt/
 out/
-训练记录.md
+*.pyc
+__pycache__/
+target/
+*.class
+*.jar
+*.o
+*.so
+
+# 运行时产物
 *.db
 *.db-shm
 *.db-wal
-.DS_Store
 *.log
+
+# 系统文件
+.DS_Store
+
+# 训练记录
+训练记录.md
 *.xlsx
